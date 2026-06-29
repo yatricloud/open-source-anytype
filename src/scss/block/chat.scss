@@ -1,0 +1,102 @@
+@import "~scss/_vars";
+@mixin cnt-2 { width: calc((100% - 4px) / 2); }
+@mixin cnt-3 { width: calc((100% - 8px) / 3); }
+@mixin cnt-4 { width: calc((100% - 12px) / 4); }
+
+.blocks {
+	.block.blockChat { @include text-common; }
+	.block.blockChat {
+		.scrollWrapper { display: flex; flex-direction: column; justify-content: flex-end; padding: 40px 0px 0px 0px; }
+		.scrollWrapper {
+			.scroll { min-height: 100%; display: flex; flex-direction: column; justify-content: flex-end; gap: 4px 0px; padding: 0px 0px 16px 0px; }
+			.section { display: flex; flex-direction: column; gap: 4px 0px; }
+		}
+
+		.chatEmptyState { 
+			display: flex; flex-direction: column; align-items: center; justify-content: center; flex-grow: 1; color: var(--color-text-secondary); 
+			margin: 64px 0px;
+		}
+		.chatEmptyState {
+			.inner { display: flex; flex-direction: column; gap: 10px 0px; }
+
+			.title { @include text-paragraph; font-weight: 600; text-align: center; }
+			.item { display: flex; flex-direction: row; align-items: center; gap: 0px 12px; }
+			.item {
+				.icon { width: 20px; height: 20px; }
+			}
+
+			.buttons { display: flex; justify-content: center; margin-top: 8px; }
+		}
+
+		.sectionDate { display: flex; justify-content: center; position: sticky; top: var(--chat-sticky-top, 0px); z-index: 10; pointer-events: none; }
+		.sectionDate {
+			.label { 
+				@include text-small; padding: 3px 10px; background: var(--color-bg-primary-90); border-radius: 13px; color: var(--color-text-secondary); 
+				font-weight: 500;
+			}
+		}
+
+		.pinnedMessage {
+			position: sticky; left: 0px; top: 52px; display: flex; align-items: center;
+			gap: 0px 8px; height: 52px; padding: 7px 0px;
+			background: var(--color-bg-primary); z-index: 11; flex-shrink: 0;
+		}
+		.pinnedMessage {
+			.pinnedIndicator { display: flex; flex-direction: column; gap: 2px 0px; height: 32px; flex-shrink: 0; }
+			.pinnedIndicator {
+				.segment { width: 2px; flex: 1; border-radius: 2px; background: var(--color-shape-highlight-dark); }
+				.segment.isActive { background: var(--color-text-primary); }
+			}
+
+			.iconObject {
+				flex-shrink: 0; border-radius: 6px; overflow: hidden;
+				background-color: var(--color-shape-highlight-medium);
+			}
+			.iconObject {
+				&.withImage, &.isFile, &.isImage, &.isVideo, &.isAudio, &.isPdf,
+				&.isHuman, &.isParticipant { background-color: unset; }
+			}
+
+			.pinnedInner { display: flex; flex-direction: column; flex: 1; min-width: 0px; }
+			.pinnedInner {
+				.pinnedLabel { @include text-small; font-weight: 500; color: var(--color-text-primary); }
+				.pinnedText {
+					font-size: 14px; line-height: 20px; letter-spacing: -0.12px; color: var(--color-text-primary);
+					@include text-overflow-nw;
+				}
+			}
+
+			.icon.unpin { width: 20px; height: 20px; flex-shrink: 0; opacity: 0; transition: opacity 0.15s ease-out; }
+
+			&:hover {
+				.icon.unpin { opacity: 1; }
+			}
+		}
+
+		.markuplink, markupobject { color: var(--color-system-accent-100); border-bottom: 0px; }
+		markupmention { padding: 1.5px 2px; background-color: var(--color-system-highlight); border-radius: 2px; }
+		markupmention {
+			name { color: var(--color-system-accent-100); font-weight: 500; border-bottom: 0px; }
+
+			&.withImage {
+				smile, .space { display: none; }
+			}
+		}
+
+		@import "./chat/attachment";
+		@import "./chat/message";
+		@import "./chat/form";
+	}
+}
+
+.pageMainChat.spaceOneToOne {
+	.blocks {
+		.block.blockChat {
+			.message {
+				.author,
+				.reply .name,
+				> .flex > .side.left { display: none; }
+			}
+		}
+	}
+}

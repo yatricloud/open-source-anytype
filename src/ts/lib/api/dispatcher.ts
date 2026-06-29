@@ -1,0 +1,1896 @@
+
+import { arrayMove } from '@dnd-kit/sortable';
+import { observable, set, runInAction } from 'mobx';
+import * as Sentry from '@sentry/browser';
+import type { Event } from 'Proto/pb/protos/events';
+import * as Response from './response';
+import type { ClientReadableStream } from 'grpc-web';
+import { ServiceClient } from './service';
+import { unaryInterceptors, streamInterceptors } from './grpc-devtools';
+import * as I from 'Interface';
+import * as M from 'Model';
+
+const SORT_IDS = [
+	'BlockAdd',
+	'BlockDelete',
+	'BlockSetChildrenIds',
+	'ObjectDetailsSet',
+	'ObjectDetailsAmend',
+	'ObjectDetailsUnset',
+	'SubscriptionCounters',
+	'BlockDataviewRelationSet',
+	'BlockDataviewRelationDelete',
+	'BlockDataviewViewSet',
+	'BlockDataviewViewUpdate',
+	'BlockDataviewViewDelete',
+];
+
+const SKIP_IDS = [ 'BlockSetCarriage' ];
+const SKIP_ERRORS = [ 'LinkPreview', 'BlockTextSetText', 'FileSpaceUsage', 'SpaceInviteGetCurrent', 'ObjectClose', 'AccountPreloadRemainingSpaces' ];
+
+/**
+ * Dispatcher class handles all communication between the Electron frontend
+ * and the anytype-heart middleware via gRPC.
+ *
+ * This is the central hub for:
+ * - Sending commands to the middleware (request method)
+ * - Receiving and processing real-time events via streaming (event method)
+ * - Managing the gRPC connection lifecycle
+ *
+ * The dispatcher maintains a persistent stream connection for receiving
+ * events and provides request/response handling for commands.
+ */
+class Dispatcher {
+
+	service: ServiceClient = null;
+	stream: ClientReadableStream<Event> = null;
+	timeoutStream = 0;
+	timeoutEvent: any = {};
+	reconnects = 0;
+	eventBuffer: { event: Event, skipDebug: boolean }[] = [];
+	flushScheduled = false;
+	rafId = 0;
+	flushTimerId = 0;
+
+	/**
+	 * Initialize the gRPC client with the middleware server address.
+	 * Must be called before any other dispatcher operations.
+	 * @param address - The gRPC server address (e.g., 'http://localhost:31007')
+	 */
+	init (address: string) {
+		address = String(address || '');
+
+		if (!address) {
+			console.error('[Dispatcher.init] No address');
+			return;
+		};
+
+		this.service = new ServiceClient(address, null, {
+			unaryInterceptors,
+			streamInterceptors,
+		});
+	};
+
+	/**
+	 * Start the event stream connection to receive real-time updates from middleware.
+	 * Sets up listeners for data, status, and end events with automatic reconnection.
+	 * Requires authentication token to be set in S.Auth.token.
+	 */
+	startStream () {
+		if (!S.Auth.token) {
+			console.error('[Dispatcher.startStream] No token');
+			return;
+		};
+
+		window.clearTimeout(this.timeoutStream);
+
+		this.stopStream();
+
+		this.stream = this.service.listenSessionEvents({ token: S.Auth.token }, null);
+
+		this.stream.on('data', (event) => {
+			this.eventBuffer.push({ event, skipDebug: false });
+
+			if (!this.flushScheduled) {
+				this.flushScheduled = true;
+
+				if (S.Common.isActiveTab) {
+					this.rafId = requestAnimationFrame(() => this.flushEvents());
+				} else {
+					this.flushTimerId = window.setTimeout(() => this.flushEvents(), 100);
+				};
+			};
+		});
+
+		this.stream.on('status', (status) => {
+			if (status.code) {
+				console.error('[Dispatcher.stream] Restarting', status);
+				this.reconnect();
+			};
+		});
+
+		this.stream.on('end', () => {
+			console.error('[Dispatcher.stream] end, restarting');
+			this.reconnect();
+		});
+	};
+
+	/**
+	 * Stop the active event stream connection.
+	 * Cancels the stream and clears the reference.
+	 */
+	stopStream () {
+		window.clearTimeout(this.timeoutStream);
+		this.reconnects = 0;
+
+		if (this.rafId) {
+			cancelAnimationFrame(this.rafId);
+		};
+
+		if (this.flushTimerId) {
+			window.clearTimeout(this.flushTimerId);
+		};
+
+		this.flushEvents();
+
+		if (this.stream) {
+			this.stream.cancel();
+			this.stream = null;
+		};
+	};
+
+	/**
+	 * Attempt to reconnect the event stream with exponential backoff.
+	 * Reconnection intervals: 3s for first 20 attempts, 5s for next 20, then 60s.
+	 * Counter resets after 40 attempts.
+	 */
+	reconnect () {
+		let t = 3;
+		if (this.reconnects == 20) {
+			t = 5;
+		};
+		if (this.reconnects == 40) {
+			t = 60;
+			this.reconnects = 0;
+		};
+
+		window.clearTimeout(this.timeoutStream);
+		this.timeoutStream = window.setTimeout(() => {
+			this.startStream();
+			this.reconnects++;
+		}, t * 1000);
+	};
+
+	/**
+	 * Flush all buffered stream events in a single MobX transaction.
+	 * Events arriving within one animation frame are processed together,
+	 * so MobX reactions fire only once at the end of the batch.
+	 */
+	flushEvents () {
+		this.flushScheduled = false;
+		this.rafId = 0;
+		this.flushTimerId = 0;
+
+		const buffer = this.eventBuffer;
+		this.eventBuffer = [];
+
+		if (!buffer.length) {
+			return;
+		};
+
+		runInAction(() => {
+			for (const item of buffer) {
+				try {
+					this.event(item.event, false, item.skipDebug);
+				} catch (e) {
+					console.error('[Dispatcher] event processing failed:', e);
+				};
+			};
+		});
+	};
+
+	/**
+	 * Process an incoming event from the middleware.
+	 * Routes events to appropriate handlers based on event type and updates
+	 * the application state accordingly.
+	 *
+	 * @param event - The protobuf event object from middleware
+	 * @param isSync - Whether this is a synchronous event (from a command response)
+	 * @param skipDebug - Whether to skip debug logging for this event
+	 */
+	event (event: Event, isSync: boolean, skipDebug: boolean) {
+		const { config, windowIsFocused } = S.Common;
+		const { account } = S.Auth;
+		const traceId = event.traceId;
+		const ctx: string[] = [ event.contextId ];
+		const debugJson = config.flagsMw.json;
+
+		if (traceId) {
+			ctx.push(traceId);
+		};
+
+		const rootId = ctx.join('-');
+		const messages = event.messages || [];
+		const log = (rootId: string, type: string, spaceId: string, data: any) => {
+			console.log(`%cEvent.${type}`, 'font-weight: bold; color: #ad139b;', rootId, spaceId);
+			if (!type) {
+				console.error('Event not found for type', type);
+			};
+
+			if (data) {
+				const d = U.Common.objectClear(U.Common.objectCopy(data));
+				console.log(debugJson ? JSON.stringify(d, null, 3) : d);
+			};
+		};
+
+		let updateParents = false;
+		let updateNumbers = false;
+		let updateMarkup = false;
+
+		messages.sort((c1: any, c2: any) => this.sort(c1, c2));
+
+		runInAction(() => {
+		for (const message of messages) {
+			const { type, data } = Mapper.Event.Data(message);
+			const spaceId = message.spaceId || '';
+			const mapped = Mapper.Event[type] ? Mapper.Event[type](data) : null;
+
+			if (!mapped) {
+				continue;
+			};
+
+			const needLog = this.needEventLog(type) && !skipDebug;
+			const spaceview = U.Space.getSpaceviewBySpaceId(spaceId);
+
+			switch (type) {
+
+				case 'AccountShow': {
+					S.Auth.accountAdd(mapped.account);
+					break;
+				};
+
+				case 'AccountUpdate': {
+					S.Auth.accountSetStatus(mapped.status);
+					break;	
+				};
+
+				case 'AccountConfigUpdate': {
+					S.Common.configSet(mapped.config, true);
+					Renderer.send('setConfig', U.Common.objectCopy(S.Common.config));
+					break;
+				};
+
+				case 'AccountLinkChallenge': {
+					Renderer.send('showChallenge', {
+						...mapped,
+						theme: S.Common.getThemeClass(),
+						lang: S.Common.interfaceLang,
+					});
+					break;
+				};
+
+				case 'DebugProfileCreated': {
+					const reason = mapped.reason || 'Unknown';
+					const electron = U.Common.getElectron();
+
+					console.log('[DebugProfileCreated] event:', mapped);
+
+					Sentry.withScope(scope => {
+						scope.setLevel('info');
+						scope.setTag('report', 'mw_profile');
+						scope.setTag('reason', reason);
+						scope.setFingerprint([ 'mw-profile', reason ]);
+
+						try {
+							scope.setContext('info', JSON.parse(mapped.jsonInfo));
+						} catch (e) {
+							scope.setExtra('info', mapped.jsonInfo);
+						};
+
+						if (mapped.path) {
+							try {
+								const size = electron.fileSize(mapped.path);
+								console.log('[DebugProfileCreated] attaching file:', mapped.path, 'size:', size);
+
+								scope.addAttachment({
+									filename: electron.fileName(mapped.path),
+									data: electron.logRead(mapped.path),
+									contentType: electron.fileMime(mapped.path) || 'application/octet-stream',
+								});
+							} catch (e) {
+								console.error('[DebugProfileCreated] logRead failed:', mapped.path, e);
+							};
+						};
+
+						Sentry.captureMessage(`MW_${reason}`);
+					});
+					break;
+				};
+
+				case 'AccountLinkChallengeHide': {
+					Renderer.send('hideChallenge', mapped);
+					break;
+				};
+
+				case 'ObjectRelationsAmend': {
+					S.Record.relationsSet(rootId, mapped.id, mapped.relations);
+					break;
+				};
+
+				case 'ObjectRelationsRemove': {
+					S.Record.relationListDelete(rootId, mapped.id, mapped.relationKeys);
+					break;
+				};
+
+				case 'ObjectRestrictionsSet': {
+					S.Block.restrictionsSet(rootId, mapped.restrictions);
+					break;
+				};
+
+				case 'ObjectAutoArchive': {
+					// For RPC responses (isSync=true) auto-archived IDs are merged into the
+					// Archive toast by the calling action via message.autoArchivedIds.
+					// For stream events (isSync=false) show a standalone AutoArchive toast.
+					if (!isSync) {
+						const { objectIds } = mapped;
+						if (objectIds.length) {
+							Preview.toastShow({ action: I.ToastAction.AutoArchive, ids: objectIds });
+						};
+					};
+					break;
+				};
+
+				case 'ObjectAutoRestore': {
+					// Same pattern as ObjectAutoArchive but for the Restore toast.
+					if (!isSync) {
+						const { objectIds } = mapped;
+						if (objectIds.length) {
+							Preview.toastShow({ action: I.ToastAction.AutoRestore, ids: objectIds });
+						};
+					};
+					break;
+				};
+
+				case 'FileSpaceUsage': {
+					const { spaces } = S.Common.spaceStorage;
+					const space = spaces.find(it => it.spaceId == mapped.spaceId);
+
+					if (space) {
+						set(space, { bytesUsage: mapped.bytesUsage });
+					} else {
+						spaces.push(mapped);
+					};
+					break;
+				};
+
+				case 'FileLimitUpdated':
+				case 'FileLocalUsage': {
+					S.Common.spaceStorageSet(mapped);
+					break;
+				};
+
+				case 'BlockAdd': {
+					const { blocks } = mapped;
+
+					for (const block of blocks) {
+						if (block.type == I.BlockType.Dataview) {
+							S.Record.relationsSet(rootId, block.id, block.content.relationLinks);
+							S.Record.viewsSet(rootId, block.id, block.content.views);
+						};
+
+						S.Block.add(rootId, new M.Block(block));
+						S.Block.updateStructure(rootId, block.id, block.childrenIds);
+					};
+
+					updateParents = true;
+					updateNumbers = true;
+					break;
+				};
+
+				case 'BlockDelete': {
+					const { blockIds } = mapped;
+
+					for (const blockId of blockIds) {
+						const block = S.Block.getLeaf(rootId, blockId);
+						if (!block) {
+							continue;
+						};
+
+						if (block.type == I.BlockType.Dataview) {
+							Action.dbClearBlock(rootId, blockId);
+						};
+
+						S.Block.delete(rootId, blockId);
+					};
+
+					updateParents = true;
+					updateNumbers = true;
+					break;
+				};
+
+				case 'BlockSetChildrenIds': {
+					const { id, childrenIds } = mapped;
+
+					S.Block.updateStructure(rootId, id, childrenIds);
+
+					updateParents = true;
+					updateNumbers = true;
+					break;
+				};
+
+				case 'BlockSetFields': {
+					const { id, fields } = mapped;
+					const block = S.Block.getLeaf(rootId, id);
+
+					if (!block) {
+						break;
+					};
+
+					S.Block.update(rootId, id, { fields });
+					break;
+				};
+
+				case 'BlockSetLink': {
+					const { id, cardStyle, iconSize, description, targetBlockId, relations, fields } = mapped;
+					const block = S.Block.getLeaf(rootId, id);
+
+					if (!block) {
+						break;
+					};
+
+					const content: any = {};
+
+					if (cardStyle !== null) {
+						content.cardStyle = cardStyle;
+					};
+
+					if (iconSize !== null) {
+						content.iconSize = iconSize;
+					};
+
+					if (description !== null) {
+						content.description = description;
+					};
+
+					if (targetBlockId !== null) {
+						content.targetBlockId = targetBlockId;
+					};
+
+					if (relations !== null) {
+						content.relations = relations;
+					};
+
+					if (fields !== null) {
+						content.fields = fields;
+					};
+
+					S.Block.updateContent(rootId, id, content);
+					break;
+				};
+
+				case 'BlockSetText': {
+					const { id, text, marks, style, checked, color, iconEmoji, iconImage } = mapped;
+					const block = S.Block.getLeaf(rootId, id);
+
+					if (!block) {
+						break;
+					};
+
+					const content: Partial<I.ContentText> = {};
+
+					if (text !== null) {
+						content.text = text;
+					};
+
+					if (marks !== null) {
+						content.marks = marks;
+					};
+
+					if (style !== null) {
+						content.style = style;
+					};
+
+					if (checked !== null) {
+						content.checked = checked;
+					};
+
+					if (color !== null) {
+						content.color = color;
+					};
+
+					if (iconEmoji !== null) {
+						content.iconEmoji = iconEmoji;
+					};
+
+					if (iconImage !== null) {
+						content.iconImage = iconImage;
+					};
+
+					S.Block.updateContent(rootId, id, content);
+
+					updateNumbers = true;
+					break;
+				};
+
+				case 'BlockSetDiv': {
+					const { id, style } = mapped;
+					const block = S.Block.getLeaf(rootId, id);
+
+					if (!block) {
+						break;
+					};
+
+					if (style !== null) {
+						block.content.style = style;
+					};
+
+					S.Block.updateContent(rootId, id, block.content);
+					break;
+				};
+
+				case 'BlockDataviewTargetObjectIdSet': {
+					const { id, targetObjectId } = mapped;
+					const block = S.Block.getLeaf(rootId, id);
+
+					if (!block) {
+						break;
+					};
+
+					S.Block.updateContent(rootId, id, { targetObjectId });
+					break;
+				};
+
+				case 'BlockDataviewIsCollectionSet': {
+					const { id, isCollection } = mapped;
+					const block = S.Block.getLeaf(rootId, id);
+
+					if (!block) {
+						break;
+					};
+
+					S.Block.updateContent(rootId, id, { isCollection });
+					break;
+				};
+
+				case 'BlockSetWidget': {
+					const { id, layout, limit, viewId } = mapped;
+					const block = S.Block.getLeaf(rootId, id);
+
+					if (!block) {
+						break;
+					};
+
+					const content: any = {};
+
+					if (layout !== null) {
+						content.layout = layout;
+					};
+
+					if (limit !== null) {
+						content.limit = limit;
+					};
+
+					if (viewId !== null) {
+						content.viewId = viewId;
+					};
+
+					S.Block.updateContent(rootId, id, content);
+					break;
+				};
+
+				case 'BlockSetFile': {
+					const { id, targetObjectId, type, style, state } = mapped;
+					const block = S.Block.getLeaf(rootId, id);
+
+					if (!block) {
+						break;
+					};
+
+					const content: any = {};
+
+					if (targetObjectId !== null) {
+						content.targetObjectId = targetObjectId;
+					};
+
+					if (type !== null) {
+						content.type = type;
+					};
+
+					if (style !== null) {
+						content.style = style;
+					};
+
+					if (state !== null) {
+						content.state = state;
+					};
+
+					S.Block.updateContent(rootId, id, content);
+					break;
+				};
+
+				case 'BlockSetBookmark': {
+					const { id, targetObjectId, state } = mapped;
+					const block = S.Block.getLeaf(rootId, id);
+
+					if (!block) {
+						break;
+					};
+
+					const content: any = {};
+
+					if (targetObjectId !== null) {
+						content.targetObjectId = targetObjectId;
+					};
+
+					if (state !== null) {
+						content.state = state;
+					};
+
+					S.Block.updateContent(rootId, id, content);
+					break;
+				};
+
+				case 'BlockSetBackgroundColor': {
+					const { id, bgColor } = mapped;
+					const block = S.Block.getLeaf(rootId, id);
+
+					if (!block) {
+						break;
+					};
+
+					S.Block.update(rootId, id, { bgColor });
+					break;
+				};
+
+				case 'BlockSetAlign': {
+					const { id, align } = mapped;
+					const block = S.Block.getLeaf(rootId, id);
+
+					if (!block) {
+						break;
+					};
+
+					S.Block.update(rootId, id, { hAlign: align });
+					break;
+				};
+
+				case 'BlockSetVerticalAlign': {
+					const { id, align } = mapped;
+					const block = S.Block.getLeaf(rootId, id);
+
+					if (!block) {
+						break;
+					};
+
+					S.Block.update(rootId, id, { vAlign: align });
+					break;
+				};
+
+				case 'BlockSetRelation': {
+					const { id, key } = mapped;
+					const block = S.Block.getLeaf(rootId, id);
+
+					if (!block) {
+						break;
+					};
+
+					const content: any = {};
+
+					if (key !== null) {
+						content.key = key;
+					};
+
+					S.Block.updateContent(rootId, id, content);
+					break;
+				};
+
+				case 'BlockSetLatex': {
+					const { id, text } = mapped;
+					const block = S.Block.getLeaf(rootId, id);
+
+					if (!block) {
+						break;
+					};
+
+					const content: any = {};
+
+					if (text !== null) {
+						content.text = text;
+					};
+
+					S.Block.updateContent(rootId, id, content);
+					break;
+				};
+
+				case 'BlockSetTableRow': {
+					const { id, isHeader } = mapped;
+					const block = S.Block.getLeaf(rootId, id);
+
+					if (!block) {
+						break;
+					};
+
+					const content: any = {};
+
+					if (isHeader !== null) {
+						content.isHeader = isHeader;
+					};
+
+					S.Block.updateContent(rootId, id, content);
+					break;
+				};
+
+				case 'BlockDataviewViewSet': {
+					const { id, view } = mapped;
+					const block = S.Block.getLeaf(rootId, id);
+
+					if (!block) {
+						break;
+					};
+
+					S.Record.viewAdd(rootId, id, view);
+					S.Block.updateWidgetViews(rootId);
+					break;
+				};
+
+				case 'BlockDataviewViewUpdate': {
+					const { id, viewId, fields } = mapped;
+					const block = S.Block.getLeaf(rootId, id);
+
+					if (!block) {
+						break;
+					};
+
+					let view = S.Record.getView(rootId, id, viewId);
+					let updateData = false;
+
+					if (fields !== null) {
+						const updateKeys = [ 'type', 'groupRelationKey', 'endRelationKey', 'pageLimit' ];
+
+						for (const f of updateKeys) {
+							if (fields[f] != view[f]) {
+								updateData = true;
+								break;
+							};
+						};
+
+						view = Object.assign(view, fields);
+					};
+
+					const keys = [ 
+						{ id: 'filter', field: 'filters', idField: 'id', mapper: 'Filter' },
+						{ id: 'sort', field: 'sorts', idField: 'id', mapper: 'Sort' },
+						{ id: 'relation', field: 'relations', idField: 'relationKey', mapper: 'ViewRelation' },
+					];
+
+					keys.forEach(key => {
+						const elements = mapped[key.field] || [];
+
+						let list = view[key.field];
+
+						elements.forEach(element => {
+
+							if (element.add) {
+								const { afterId, items } = element.add;
+								const idx = afterId ? list.findIndex(it => it[key.idField] == afterId) + 1 : list.length;
+
+								items.forEach((it, i) => {
+									// For relations, preserve existing width if adding a duplicate
+									// (protobuf3 defaults unset int fields to 0)
+									if (key.id == 'relation') {
+										const existingIdx = list.findIndex(existing => existing[key.idField] == it[key.idField]);
+										if (existingIdx >= 0) {
+											if (!it.width) {
+												it.width = list[existingIdx]?.width || 0;
+											};
+											list[existingIdx] = it;
+											return;
+										};
+									};
+									list.splice(idx + i, 0, it);
+								});
+
+								if ([ 'filter', 'sort', 'relation' ].includes(key.id)) {
+									updateData = true;
+								};
+							};
+
+							if (element.move) {
+								const { afterId, ids } = element.move;
+								const idx = afterId ? list.findIndex(it => it && (it[key.idField] == afterId)) + 1 : 0;
+
+								ids.forEach((id: string, i: number) => {
+									const oidx = list.findIndex(it => it[key.idField] == id);
+									if (oidx >= 0) {
+										list = arrayMove(list, oidx, idx + i);
+									};
+								});
+
+								if ([ 'sort' ].includes(key.id)) {
+									updateData = true;
+								};
+							};
+
+							if (element.update) {
+								const { id, item } = element.update;
+
+								if (item) {
+									const idx = list.findIndex(it => it[key.idField] == id);
+
+									if ([ 'filter', 'sort' ].includes(key.id)) {
+										updateData = true;
+									};
+
+									if (idx >= 0) {
+										if (key.id == 'relation') {
+											const updateKeys = [ 'isVisible' ];
+
+											for (const f of updateKeys) {
+												if (list[idx][f] != item[f]) {
+													updateData = true;
+													break;
+												};
+											};
+
+											// Preserve existing custom width if update doesn't specify one
+											// (protobuf3 defaults unset int fields to 0)
+											if (!item.width) {
+												item.width = list[idx]?.width || 0;
+											};
+										};
+
+										list[idx] = item;
+									};
+								};
+							};
+
+							if (element.remove) {
+								const { ids } = element.remove;
+
+								list = list.filter(it => !ids.includes(it[key.idField]));
+
+								if ([ 'filter', 'sort' ].includes(key.id)) {
+									updateData = true;
+								};
+							};
+						});
+
+						view[key.field] = list;
+					});
+
+					S.Record.viewUpdate(rootId, id, view);
+					S.Block.updateWidgetViews(rootId);
+
+					if (updateData) {
+						U.Dom.eventDispatch(window, 'updateDataviewData');
+						S.Block.updateWidgetData(rootId);
+					};
+					break;
+				};
+
+				case 'BlockDataviewViewDelete': {
+					const { id, viewId } = mapped;
+					const subId = S.Record.getSubId(rootId, id);
+
+					let current = S.Record.getMeta(subId, '').viewId;
+					
+					S.Record.viewDelete(rootId, id, viewId);
+
+					if (viewId == current) {
+						const views = S.Record.getViews(rootId, id);
+
+						current = views.length ? views[views.length - 1].id : '';
+						S.Record.metaSet(subId, '', { viewId: current });
+					};
+
+					S.Block.updateWidgetViews(rootId);
+					break;
+				};
+
+				case 'BlockDataviewViewOrder': {
+					const { id, viewIds } = mapped;
+
+					S.Record.viewsSort(rootId, id, viewIds);
+					S.Block.updateWidgetViews(rootId);
+					break; 
+				};
+
+				case 'BlockDataviewRelationDelete': {
+					const { id, relationKeys } = mapped;
+
+					S.Record.relationListDelete(rootId, id, relationKeys);
+					break;
+				};
+
+				case 'BlockDataviewRelationSet': {
+					const { id, relations } = mapped;
+
+					S.Record.relationsSet(rootId, id, relations);
+					break;
+				};
+
+				case 'BlockDataViewGroupOrderUpdate': {
+					const { id, groupOrder } = mapped;
+					const block = S.Block.getLeaf(rootId, id);
+
+					if (!block || (groupOrder === null)) {
+						break;
+					};
+
+					Dataview.groupOrderUpdate(rootId, id, groupOrder.viewId, groupOrder.groups);
+					S.Block.updateWidgetData(rootId);
+					break;
+				};
+
+				case 'BlockDataViewObjectOrderUpdate': {
+					const { id, viewId, groupId, changes } = mapped;
+					const block = S.Block.getLeaf(rootId, id);
+
+					if (!block) {
+						break;
+					};
+
+					const cb = it => (it.viewId == viewId) && (it.groupId == groupId);
+					const index = block.content.objectOrder.findIndex(cb);
+
+					let el = block.content.objectOrder.find(cb);
+					if (!el) {
+						el = { viewId, groupId, objectIds: observable.array([]) };
+						block.content.objectOrder.push(el);
+					};
+
+					changes.forEach(it => {
+						const idx = it.afterId ? el.objectIds.indexOf(it.afterId) + 1 : 0;
+
+						switch (it.operation) {
+							case I.SliceOperation.Add:
+								it.ids.forEach((id: string, i: number) => {
+									idx >= 0 ? el.objectIds.splice(idx + i, 0, id) : el.objectIds.unshift(id);
+								});
+								break;
+
+							case I.SliceOperation.Move:
+								if (idx >= 0) {
+									it.ids.forEach((id: string, i: number) => {
+										const oidx = el.objectIds.indexOf(id);
+										if (oidx >= 0) {
+											el.objectIds = arrayMove(el.objectIds, oidx, idx + i);
+										};
+									});
+								};
+								break;
+
+							case I.SliceOperation.Remove:
+								el.objectIds = el.objectIds.filter(id => !it.ids.includes(id));
+								break;
+
+							case I.SliceOperation.Replace:
+								el.objectIds = it.ids;
+								break;
+						};
+					});
+
+					block.content.objectOrder[index] = el;
+					S.Block.updateContent(rootId, id, { objectOrder: block.content.objectOrder });
+					S.Block.updateWidgetData(rootId);
+					break;
+				};
+
+				case 'ObjectDetailsSet': {
+					const { id, subIds, details } = mapped;
+
+					this.detailsUpdate(details, rootId, id, subIds, true);
+
+					if (subIds.some(id => id.startsWith(J.Constant.subId.type + '-'))) {
+						U.Subscription.createTypeCheck();
+					};
+
+					updateMarkup = true;
+					break;
+				};
+
+				case 'ObjectDetailsAmend': {
+					const { id, subIds, details } = mapped;
+
+					this.detailsUpdate(details, rootId, id, subIds, false);
+
+					updateMarkup = true;
+					break;
+				};
+
+				case 'ObjectDetailsUnset': {
+					const { id, subIds, keys } = mapped;
+
+					// Subscriptions
+					this.getUniqueSubIds(subIds).forEach(subId => S.Detail.delete(subId, id, keys));
+
+					if (rootId) {
+						S.Detail.delete(rootId, id, keys);
+					};
+
+					updateMarkup = true;
+					break;
+				};
+
+				case 'SubscriptionAdd': {
+					const { id, afterId, subId } = mapped;
+
+					this.subscriptionPosition(subId, id, afterId, true);
+					break;
+				};
+
+				case 'SubscriptionRemove': {
+					const { id } = mapped;
+					const [ subId, dep = '' ] = this.parseSubId(mapped.subId);
+
+					if (!dep) {
+						S.Record.recordDelete(subId, '', id);
+					};
+					break;
+				};
+
+				case 'SubscriptionPosition': {
+					const { id, afterId, subId } = mapped;
+
+					this.subscriptionPosition(subId, id, afterId, false);
+					break;
+				};
+
+				case 'SubscriptionCounters': {
+					const [ subId, dep = '' ] = this.parseSubId(mapped.subId);
+
+					if (!dep) {
+						S.Record.metaSet(subId, '', { total: mapped.total });
+					};
+					break;
+				};
+
+				case 'SubscriptionGroups': {
+					const { group, remove } = mapped;
+					const [ rootId, blockId = '' ] = mapped.subId.split('-');
+
+					if (remove) {
+						S.Record.groupsRemove(rootId, blockId, [ group.id ]);
+					} else {
+						S.Record.groupsAdd(rootId, blockId, [ group ]);
+					};
+
+					S.Block.updateWidgetData(rootId);
+					break;
+				};
+
+				case 'NotificationSend': {
+					const item = new M.Notification(mapped.notification);
+
+					S.Notification.add(item);
+
+					if (!windowIsFocused && S.Common.isActiveTab) {
+						Renderer.send('notification', {
+							id: item.id,
+							title: U.String.stripTags(item.title),
+							text: U.String.stripTags(item.text),
+							silent: !Sound.isSystem(),
+						});
+						Sound.playNotification();
+					};
+					break;
+				};
+
+				case 'NotificationUpdate': {
+					S.Notification.update(mapped.notification);
+					break;
+				};
+
+				case 'PayloadBroadcast': {
+					if (!S.Common.isActiveTab) {
+						break;
+					};
+
+					let payload: any = {};
+					try { payload = JSON.parse(mapped.payload); } catch (e) { console.warn('[Dispatcher] payload parse failed:', e); };
+
+					Renderer.send('payloadBroadcast', payload);
+					break;
+				};
+
+				case 'ImportFinish': {
+					if (!account) {
+						break;
+					};
+
+					const { count, type } = mapped;
+
+					analytics.event('Import', { type, count });
+					break;
+				};
+
+				case 'ChatAdd': {
+					const { orderId, dependencies } = mapped;
+					const message = new M.ChatMessage({ ...mapped.message, dependencies, chatId: rootId });
+					const notification = S.Chat.getMessageSimpleText(spaceId, message, !spaceview?.isOneToOne);
+					const discussionParentId = S.Chat.getDiscussionParentId(spaceId, rootId);
+					const isDiscussion = !!discussionParentId;
+
+					let showNotification = false;
+
+					if (spaceview) {
+						const notificationMode = isDiscussion
+							? U.Object.getDiscussionNotificationMode(spaceview, discussionParentId)
+							: U.Object.getChatNotificationMode(spaceview, rootId);
+						if (notificationMode == I.NotificationMode.All) {
+							showNotification = true;
+						} else
+						if (notificationMode == I.NotificationMode.Mentions) {
+							showNotification = S.Chat.isMention(message, U.Space.getParticipantId(spaceId, account.id));
+						};
+					};
+
+					mapped.subIds = S.Chat.checkVaultSubscriptionIds(mapped.subIds, spaceId, rootId);
+
+					const commentSubIds = mapped.subIds.filter(id => id.startsWith('comment-'));
+					const chatSubIds = mapped.subIds.filter(id => !id.startsWith('comment-'));
+
+					chatSubIds.forEach(subId => {
+						const list = S.Chat.getList(subId);
+
+						let idx = list.findIndex(it => it.orderId == orderId);
+						if (idx < 0) {
+							idx = list.length;
+						};
+
+						S.Chat.add(subId, idx, message);
+					});
+
+					commentSubIds.forEach(subId => {
+						const commentMsg: I.CommentMessage = {
+							...mapped.message,
+							content: {
+								...mapped.message.content,
+								parts: U.Comment.blocksToParts(mapped.message.blocks, mapped.message.content),
+							},
+							replyCount: 0,
+						};
+
+						if (mapped.message.replyToMessageId) {
+							S.Comment.addReply(mapped.message.replyToMessageId, commentMsg);
+
+							const post = S.Comment.getPostById(subId, mapped.message.replyToMessageId);
+							if (post) {
+								set(post, { replyCount: (post.replyCount || 0) + 1 });
+							};
+						} else {
+							S.Comment.addPost(subId, commentMsg);
+						};
+					});
+
+					if (showNotification && notification && !windowIsFocused && S.Common.isActiveTab && (message.creator != account.id)) {
+						const title = [];
+						let canNotify = true;
+						let openPayload: any = { id: rootId, layout: I.ObjectLayout.Chat, spaceId };
+
+						if (spaceview) {
+							title.push(U.String.shorten(spaceview.name, 32));
+						};
+
+						if (isDiscussion) {
+							const parent = S.Chat.getDiscussionParentDetail(spaceId, discussionParentId, [ 'name', 'layout', 'isArchived' ]);
+							if (!parent._empty_ && !parent.isArchived) {
+								title.push(U.String.shorten(U.Object.name(parent), 32));
+								openPayload = { id: discussionParentId, layout: parent.layout, spaceId };
+							} else {
+								canNotify = false;
+							};
+						} else
+						if (!spaceview.isOneToOne) {
+							const chat = S.Detail.get(J.Constant.subId.chatGlobal, rootId, [ 'name' ], true);
+							if (!chat._empty_) {
+								title.push(U.String.shorten(chat.name, 32));
+							} else {
+								canNotify = false;
+							};
+						};
+
+						if (canNotify) {
+							Renderer.send('notification', {
+								id: message.id,
+								title: title.join(' - '),
+								text: notification,
+								cmd: 'openChat',
+								payload: openPayload,
+								silent: !Sound.isSystem(),
+							});
+							Sound.playNotification();
+						};
+					};
+
+					U.Dom.eventDispatch(window, 'messageAdd', { message, subIds: mapped.subIds });
+					break;
+				};
+
+				case 'ChatUpdate': {
+					mapped.subIds = S.Chat.checkVaultSubscriptionIds(mapped.subIds, spaceId, rootId);
+
+					mapped.subIds.forEach(subId => {
+						if (subId.startsWith('comment-')) {
+							const commentMsg: Partial<I.CommentMessage> = {
+								id: mapped.message.id,
+								content: {
+									...mapped.message.content,
+									parts: U.Comment.blocksToParts(mapped.message.blocks, mapped.message.content),
+								},
+								attachments: mapped.message.attachments || [],
+								reactions: mapped.message.reactions || [],
+							};
+
+							if (mapped.message.replyToMessageId) {
+								S.Comment.updateReply(mapped.message.replyToMessageId, commentMsg);
+							} else {
+								S.Comment.updatePost(subId, commentMsg);
+							};
+						} else {
+							S.Chat.update(subId, mapped.message);
+						};
+					});
+
+					U.Dom.eventDispatch(window, 'messageUpdate', { message: mapped.message, subIds: mapped.subIds });
+					break;
+				};
+
+				case 'ChatStateUpdate': {
+					mapped.subIds = S.Chat.checkVaultSubscriptionIds(mapped.subIds, spaceId, rootId);
+
+					const chatPreviewSubId = S.Chat.getChatSubId(J.Constant.subId.chatPreview, spaceId, rootId);
+					if (!mapped.subIds.includes(chatPreviewSubId)) {
+						mapped.subIds.push(chatPreviewSubId);
+					};
+
+					mapped.subIds
+						.filter(subId => !subId.startsWith('comment-'))
+						.forEach(subId => S.Chat.setState(subId, mapped.state));
+					break;
+				};
+
+				case 'ChatUpdateMessageReadStatus': {
+					mapped.subIds = S.Chat.checkVaultSubscriptionIds(mapped.subIds, spaceId, rootId);
+					mapped.subIds.forEach(subId => {
+						if (subId.startsWith('comment-')) {
+							S.Comment.setReadMessageStatus(subId, mapped.ids, mapped.isRead);
+						} else {
+							S.Chat.setReadMessageStatus(subId, mapped.ids, mapped.isRead);
+						};
+					});
+					break;
+				};
+
+				case 'ChatUpdateMentionReadStatus': {
+					mapped.subIds = S.Chat.checkVaultSubscriptionIds(mapped.subIds, spaceId, rootId);
+					mapped.subIds.forEach(subId => {
+						if (subId.startsWith('comment-')) {
+							S.Comment.setReadMentionStatus(subId, mapped.ids, mapped.isRead);
+						} else {
+							S.Chat.setReadMentionStatus(subId, mapped.ids, mapped.isRead);
+						};
+					});
+					break;
+				};
+
+				case 'ChatUpdateMessageSyncStatus': {
+					mapped.subIds = S.Chat.checkVaultSubscriptionIds(mapped.subIds, spaceId, rootId);
+					mapped.subIds.forEach(subId => {
+						if (subId.startsWith('comment-')) {
+							S.Comment.setSyncStatus(subId, mapped.ids, mapped.isSynced);
+						} else {
+							S.Chat.setSyncStatus(subId, mapped.ids, mapped.isSynced);
+						};
+					});
+					break;
+				};
+
+				case 'ChatUpdateReactionReadStatus': {
+					mapped.subIds = S.Chat.checkVaultSubscriptionIds(mapped.subIds, spaceId, rootId);
+					mapped.subIds.forEach(subId => {
+						S.Chat.setReadReactionStatus(subId, mapped.ids, mapped.isRead);
+					});
+					break;
+				};
+
+				case 'ChatDelete': {
+					mapped.subIds = S.Chat.checkVaultSubscriptionIds(mapped.subIds, spaceId, rootId);
+					mapped.subIds.forEach(subId => {
+						if (subId.startsWith('comment-')) {
+							const post = S.Comment.getPostById(subId, mapped.id);
+
+							if (post) {
+								S.Comment.deletePost(subId, mapped.id);
+							} else {
+								const posts = S.Comment.getPosts(subId);
+								for (const p of posts) {
+									const replies = S.Comment.getReplies(p.id);
+									const reply = replies.find(r => r.id == mapped.id);
+
+									if (reply) {
+										S.Comment.deleteReply(p.id, mapped.id);
+										set(p, { replyCount: Math.max(0, (p.replyCount || 0) - 1) });
+										break;
+									};
+								};
+							};
+						} else {
+							S.Chat.delete(subId, mapped.id);
+						};
+					});
+					break;
+				};
+
+				case 'ChatUpdateReactions': {
+					mapped.subIds = S.Chat.checkVaultSubscriptionIds(mapped.subIds, spaceId, rootId);
+
+					let oldReactions: I.ChatMessageReaction[] = [];
+					let notificationMessage: I.ChatMessage = null;
+
+					mapped.subIds.forEach((subId) => {
+						if (subId.startsWith('comment-')) {
+							const post = S.Comment.getPostById(subId, mapped.id);
+							if (post) {
+								set(post, { reactions: mapped.reactions });
+							} else {
+								// Search in replies
+								const posts = S.Comment.getPosts(subId);
+								for (const p of posts) {
+									const replies = S.Comment.getReplies(p.id);
+									const reply = replies.find(r => r.id == mapped.id);
+									if (reply) {
+										set(reply, { reactions: mapped.reactions });
+										break;
+									};
+								};
+							};
+						} else {
+							const message = S.Chat.getMessageById(subId, mapped.id);
+							if (message) {
+								if (!notificationMessage) {
+									oldReactions = (message.reactions || []).map(r => ({ icon: r.icon, authors: [ ...r.authors ] }));
+									notificationMessage = message;
+								};
+								set(message, { reactions: mapped.reactions });
+							};
+						};
+					});
+
+					// Send OS notification for new reactions in 1:1 spaces
+					if (
+						notificationMessage &&
+						spaceview?.isOneToOne &&
+						!windowIsFocused &&
+						S.Common.isActiveTab &&
+						(notificationMessage.creator == account.id)
+					) {
+						const notificationMode = U.Object.getChatNotificationMode(spaceview, rootId);
+
+						if (notificationMode != I.NotificationMode.Nothing) {
+							// Find newly added reactions by diffing old and new
+							const newReactions = mapped.reactions as I.ChatMessageReaction[];
+							const addedEmojis: { icon: string; author: string }[] = [];
+
+							for (const nr of newReactions) {
+								const old = oldReactions.find(r => r.icon == nr.icon);
+								const oldAuthors = old ? old.authors : [];
+
+								for (const author of nr.authors) {
+									if ((author != account.id) && !oldAuthors.includes(author)) {
+										addedEmojis.push({ icon: nr.icon, author });
+									};
+								};
+							};
+
+							if (addedEmojis.length) {
+								const { icon, author } = addedEmojis[0];
+								const participantId = U.Space.getParticipantId(spaceId, author);
+								const participant = S.Detail.get(U.Subscription.spaceSubId(J.Constant.subId.participant), participantId);
+								const authorName = participant && !participant._empty_ ? U.Object.name(participant) : '';
+								const messagePreview = S.Chat.getMessageSimpleText(spaceId, notificationMessage, false);
+
+								if (authorName) {
+									const title = U.String.shorten(spaceview.name, 32);
+									const text = `${icon} to ${U.String.shorten(messagePreview, 48)}`;
+
+									Renderer.send('notification', {
+										id: mapped.id,
+										title,
+										text,
+										cmd: 'openChat',
+										payload: { id: rootId, layout: I.ObjectLayout.Chat, spaceId },
+										silent: !Sound.isSystem(),
+									});
+									Sound.playNotification();
+								};
+							};
+						};
+					};
+
+					U.Dom.eventDispatch(window, 'reactionUpdate', notificationMessage);
+					break;
+				};
+
+				case 'ChatUpdatePinnedStatus': {
+					mapped.subIds = S.Chat.checkVaultSubscriptionIds(mapped.subIds, spaceId, rootId);
+					mapped.subIds.forEach(subId => {
+						const message = S.Chat.getMessageById(subId, mapped.message?.id);
+						if (message) {
+							set(message, { isPinned: mapped.isPinned });
+						};
+					});
+
+					U.Dom.eventDispatch(window, 'pinnedStatusUpdate', {
+						message: mapped.message,
+						isPinned: mapped.isPinned,
+						subIds: mapped.subIds,
+					});
+					break;
+				};
+
+				case 'ProcessNew': {
+					const { process } = mapped;
+					const { progress, type } = process;
+
+					S.Progress.update({
+						...process,
+						current: progress.done,
+						total: progress.total,
+						canCancel: [ 
+							I.ProgressType.Migrate, 
+							I.ProgressType.Import, 
+							I.ProgressType.Export, 
+							I.ProgressType.Drop,
+						].includes(type),
+					});
+					break;
+				};
+
+				case 'ProcessUpdate': {
+					const { process } = mapped;
+					const { progress } = process;
+
+					S.Progress.update({
+						...process,
+						current: progress.done,
+						total: progress.total,
+					});
+					break;
+				};
+
+				case 'ProcessDone': {
+					S.Progress.delete(mapped.process.id);
+					break;
+				};
+
+				case 'SpaceSyncStatusUpdate':
+				case 'P2pStatusUpdate': {
+					S.Auth.syncStatusUpdate(mapped);
+					break;
+				};
+
+				case 'MembershipV2Update': {
+					S.Membership.dataUpdate(mapped.data);
+
+					const { data } = S.Membership;
+					const purchased = data?.getTopPurchasedProduct();
+					const product = data?.getTopProduct();
+
+					if (!purchased || !product) {
+						break;
+					};
+
+					if (purchased.isFinalization) {
+						Action.finalizeMembership(product, analytics.route.settingsMembership);
+					};
+					break;
+				};
+
+				case 'MembershipV2ProductsUpdate': {
+					S.Membership.productsUpdate(mapped.products);
+					break;
+				};
+
+			};
+
+			if (needLog) {
+				log(rootId, type, spaceId, data);
+			};
+		};
+		});
+
+		window.setTimeout(() => {
+			if (S.Common.isActiveTab) {
+				if (updateParents) {
+					S.Block.updateStructureParents(rootId);
+				};
+
+				if (updateNumbers) {
+					S.Block.updateNumbers(rootId);
+				};
+
+				if (updateMarkup) {
+					S.Block.updateMarkup(rootId);
+				};
+			} else {
+				if (updateParents) {
+					S.Block.deferredParentUpdates.add(rootId);
+				};
+
+				if (updateNumbers) {
+					S.Block.deferredNumberUpdates.add(rootId);
+				};
+
+				if (updateMarkup) {
+					S.Block.deferredMarkupUpdates.add(rootId);
+				};
+			};
+		});
+	};
+
+	/**
+	 * Extract unique subscription IDs by removing dependency suffixes.
+	 * Subscription IDs may contain '/dep' suffixes for dependency tracking.
+	 * @param subIds - Array of subscription IDs (may include '/dep' suffixes)
+	 * @returns Array of unique base subscription IDs
+	 */
+	getUniqueSubIds (subIds: string[]) {
+		return U.Common.arrayUnique((subIds || []).map(it => it.split('/')[0]));
+	};
+
+	/**
+	 * Update object details across all relevant subscription stores.
+	 * Handles special cases for space subscriptions and dashboard updates.
+	 *
+	 * @param details - Object containing detail key-value pairs to update
+	 * @param rootId - The root/context ID for the update
+	 * @param id - The object ID being updated
+	 * @param subIds - Array of subscription IDs that should receive the update
+	 * @param clear - If true, replace all details; if false, merge with existing
+	 */
+	detailsUpdate (details: any, rootId: string, id: string, subIds: string[], clear: boolean) {
+		subIds = this.getUniqueSubIds(subIds);
+		subIds.forEach(subId => S.Detail.update(subId, { id, details }, clear));
+
+		const { space } = S.Common;
+		const keys = Object.keys(details);
+		const check = [ 'creator', 'homepage', 'spaceAccountStatus' ];
+		const intersection = check.filter(k => keys.includes(k));
+
+		if (subIds.length) {
+			if (subIds.includes(J.Constant.subId.space)) {
+				const object = U.Space.getSpaceview(id);
+
+				if (intersection.length && object.targetSpaceId) {
+					U.Subscription.createSubSpace([ object.targetSpaceId ]);
+				};
+
+				if (object.isAccountDeleted && (object.targetSpaceId == space)) {
+					U.Space.openFirstSpaceOrVoid(null, { replace: true });
+				};
+			};
+		};
+
+		if (!rootId) {
+			return;
+		};
+
+		S.Detail.update(rootId, { id, details }, clear);
+
+		const root = S.Block.getLeaf(rootId, id);
+
+		if (id == rootId) {
+			if (root) {
+				if ((undefined !== details.layout) && (root.layout != details.layout)) {
+					S.Block.update(rootId, rootId, { layout: details.layout });
+				};
+
+				if ((undefined !== details.resolvedLayout) && (root.layout != details.resolvedLayout)) {
+					S.Block.update(rootId, rootId, { layout: details.resolvedLayout });
+				};
+			};
+
+			keyboard.setWindowTitle();
+		};
+
+		if (undefined !== details.setOf) {
+			const object = S.Detail.get(rootId, rootId, [ 'name', 'setOf', 'layout' ], true);
+
+			if (U.Object.isSetLayout(object.layout) || U.Object.isCollectionLayout(object.layout)) {
+				S.Block.updateWidgetData(rootId);
+			};
+
+			U.Dom.eventDispatch(window, 'updateDataviewData');
+		};
+	};
+
+	/**
+	 * Update the position of a record within a subscription's ordered list.
+	 * Used for maintaining correct sort order when items are added or moved.
+	 *
+	 * @param subId - Subscription ID containing the record list
+	 * @param id - ID of the record to position
+	 * @param afterId - ID of the record after which to place the item (empty for start)
+	 * @param isAdding - Whether this is a new addition (skip if already exists)
+	 */
+	parseSubId (subId: string): [string, string] {
+		const idx = subId.indexOf('/');
+		if (idx === -1) {
+			return [ subId, '' ];
+		};
+		return [ subId.slice(0, idx), subId.slice(idx + 1) ];
+	};
+
+	subscriptionPosition (subId: string, id: string, afterId: string, isAdding: boolean): void {
+		const [ sid, dep ] = this.parseSubId(subId);
+		if (dep) {
+			return;
+		};
+
+		let records = S.Record.getRecordIds(sid, '');
+		let newIndex = records.indexOf(afterId);
+
+		const oldIndex = records.indexOf(id);
+
+		if (isAdding && (oldIndex >= 0)) {
+			return;
+		};
+
+		if (!afterId) {
+			newIndex = 0;
+		} else
+		if ((newIndex >= 0) && (newIndex < oldIndex)) {
+			newIndex++;
+		};
+
+		if (oldIndex < 0) {
+			records.splice(afterId ? newIndex + 1 : 0, 0, id);
+		} else
+		if (oldIndex !== newIndex) {
+			records = arrayMove(records, oldIndex, newIndex);
+		};
+
+		S.Record.recordsSet(sid, '', records);
+	};
+
+	/**
+	 * Comparator function for sorting events by their type priority.
+	 * Events in SORT_IDS are processed in array order to ensure
+	 * dependent operations (e.g., BlockAdd before BlockSetChildrenIds) work correctly.
+	 *
+	 * @param c1 - First event message
+	 * @param c2 - Second event message
+	 * @returns Negative if c1 should come first, positive if c2 should come first
+	 */
+	sort (c1: any, c2: any) {
+		const t1 = Mapper.Event.Type(c1);
+		const t2 = Mapper.Event.Type(c2);
+		const idx1 = SORT_IDS.findIndex(it => it == t1);
+		const idx2 = SORT_IDS.findIndex(it => it == t2);
+
+		if (idx1 > idx2) return 1;
+		if (idx1 < idx2) return -1;
+		return 0;
+	};
+
+	/**
+	 * Process an ObjectView response and initialize block/detail stores.
+	 * Called when opening or showing an object to populate the UI state.
+	 *
+	 * @param rootId - Root object ID
+	 * @param traceId - Trace ID for the operation (used for context disambiguation)
+	 * @param objectView - The ObjectView data from middleware containing blocks and details
+	 * @param needCheck - Whether to check for existing popup structures to avoid duplicates
+	 */
+	onObjectView (rootId: string, traceId: string, objectView: any, needCheck: boolean) {
+		const { details, restrictions, participants } = objectView;
+		const structure: any[] = [];
+		const contextId = [ rootId, traceId ].filter(it => it).join('-');
+		const matchRoute = keyboard.getRouteMatch().params;
+		const matchPopup = keyboard.getPopupMatch().params;
+		const alreadyExists = needCheck && keyboard.isPopup() && (rootId == matchRoute.id) && (matchRoute.action == matchPopup.action);
+
+		// Block structure already exists
+		if (!alreadyExists) {
+			const root = objectView.blocks.find(it => it.id == rootId);
+
+			if (root && root.fields.analyticsContext) {
+				analytics.setContext(root.fields.analyticsContext);
+			} else {
+				analytics.removeContext();
+			};
+
+			S.Detail.set(contextId, details);
+			S.Block.restrictionsSet(contextId, restrictions);
+			S.Block.participantsSet(contextId, participants);
+
+			if (root) {
+				const object = S.Detail.get(contextId, rootId, [ 'layout' ], true);
+
+				root.type = I.BlockType.Page;
+				root.layout = object.layout;
+			};
+
+			const blocks = objectView.blocks.map(it => {
+				if (it.type == I.BlockType.Dataview) {
+					S.Record.relationsSet(contextId, it.id, it.content.relationLinks);
+					S.Record.viewsSet(contextId, it.id, it.content.views);
+				};
+
+				structure.push({ id: it.id, childrenIds: it.childrenIds });
+				return new M.Block(it);
+			});
+
+			S.Block.set(contextId, blocks);
+			S.Block.setStructure(contextId, structure);
+		};
+
+		S.Block.updateStructureParents(contextId);
+		S.Block.updateNumbers(contextId);
+		S.Block.updateMarkup(contextId);
+
+		keyboard.setWindowTitle();
+	};
+
+	/**
+	 * Send a command request to the middleware and handle the response.
+	 * This is the main method for all command-based communication with anytype-heart.
+	 *
+	 * @param type - The command type name (e.g., 'ObjectOpen', 'BlockCreate')
+	 * @param data - The protobuf request object with command parameters
+	 * @param callBack - Optional callback invoked with the processed response
+	 */
+	public request (type: string, data: any, callBack?: (message: any) => void) {
+		type = type.replace(/^command_/, '');
+
+		const { config } = S.Common;
+		const debugTime = config.flagsMw.time;
+		const debugJson = config.flagsMw.json;
+		const t0 = performance.now();
+		const needLog = this.needRequestLog(type);
+
+		let t1 = 0;
+		let t2 = 0;
+
+		if (needLog) {
+			console.log(`%cRequest.${type}`, 'font-weight: bold; color: blue;');
+			const d = U.Common.objectClear(U.Common.objectCopy(data));
+			console.log(debugJson ? JSON.stringify(d, null, 3) : d);
+		};
+
+		try {
+			this.service.request(type, data, { token: S.Auth.token }, (error: any, response: any) => {
+				if (error) {
+					console.error('GRPC Error', type, error);
+					callBack?.({ error: { code: error.code, description: error.message } });
+					return;
+				};
+
+				if (!response) {
+					return;
+				};
+
+				t1 = performance.now();
+
+				const err = response.error;
+				const code = err ? err.code : 0;
+				const description = err ? err.description : '';
+
+				let message: any = {};
+				if (!code && Response[type]) {
+					message = Response[type](response);
+				};
+
+				message.event = response.event || null;
+				message.error = { code, description };
+
+				if (message.error.code) {
+					if (!SKIP_ERRORS.includes(type)) {
+						console.error('Error', type, 'code:', message.error.code, 'description:', message.error.description);
+
+						//Sentry.captureMessage(`${type}: code: ${code} msg: ${message.error.description}`);
+						analytics.event('Exception', { method: type, code: message.error.code });
+					};
+
+					message.error.description = U.Common.translateError(type, message.error);
+				};
+
+				if (needLog) {
+					console.log(`%cResponse.${type}`, 'font-weight: bold; color: green;');
+					const d = U.Common.objectClear(U.Common.objectCopy(response));
+					console.log(debugJson ? JSON.stringify(d, null, 3) : d);
+				};
+
+				if (message.event) {
+					message.autoArchivedIds = (message.event.messages || [])
+						.filter((msg: any) => msg.objectAutoArchive?.objectIds?.length)
+						.flatMap((msg: any) => msg.objectAutoArchive.objectIds);
+
+					message.autoRestoredIds = (message.event.messages || [])
+						.filter((msg: any) => msg.objectAutoRestore?.objectIds?.length)
+						.flatMap((msg: any) => msg.objectAutoRestore.objectIds);
+
+					runInAction(() => this.event(message.event, true, true));
+				};
+
+				const middleTime = Math.ceil(t1 - t0);
+				message.middleTime = middleTime;
+
+				callBack?.(message);
+
+				t2 = performance.now();
+
+				const renderTime = Math.ceil(t2 - t1);
+				const totalTime = middleTime + renderTime;
+
+				if (debugTime && !SKIP_IDS.includes(type)) {
+					const times = [
+						'Middle:', middleTime + 'ms',
+						'Render:', renderTime + 'ms',
+						'Total:', totalTime + 'ms',
+					];
+					console.log(`%cTimes.${type}`, 'font-weight: bold; color: darkgreen;', times.join('\t'));
+				};
+			});
+		} catch (err) {
+			console.error(err);
+		};
+	};
+
+	/**
+	 * Determine if a request should be logged based on debug configuration.
+	 * Respects separate flags for general requests vs subscription commands.
+	 *
+	 * @param type - The command type name
+	 * @returns True if the request should be logged
+	 */
+	needRequestLog (type: string) {
+		const { config } = S.Common;
+		const debugRequest = config.flagsMw.request;
+		const debugSubscribe = config.flagsMw.subscribe;
+		const subscribeCommands = [ 'ObjectSearchSubscribe', 'ObjectSearchUnsubscribe', 'ObjectSubscribeIds', 'ObjectCrossSpaceSearchSubscribe' ];
+
+		if (debugSubscribe && subscribeCommands.includes(type)) {
+			return true;
+		};
+
+		if (debugRequest && !SKIP_IDS.includes(type) && !subscribeCommands.includes(type)) {
+			return true;
+		};
+	};
+
+	/**
+	 * Determine if an event should be logged based on debug configuration.
+	 * Events are categorized into: general events, sync events, file events, and subscribe events.
+	 * Each category has its own debug flag.
+	 *
+	 * @param type - The event type name
+	 * @returns True if the event should be logged
+	 */
+	needEventLog (type: string) {
+		const { config } = S.Common;
+		const { event, sync, file, subscribe } = config.flagsMw;
+		const fileEvents = [ 'FileLocalUsage', 'FileSpaceUsage' ];
+		const syncEvents = [ 'SpaceSyncStatusUpdate', 'P2pStatusUpdate', 'ThreadStatus' ];
+		const subscribeEvents = [ 'SubscriptionAdd', 'SubscriptionRemove', 'SubscriptionCounters', 'SubscriptionPosition' ];
+
+		let check = false;
+		if (event && !syncEvents.concat(fileEvents).concat(subscribeEvents).includes(type)) {
+			check = true;
+		};
+		if (sync && syncEvents.includes(type)) {
+			check = true;
+		};
+		if (file && fileEvents.includes(type)) {
+			check = true;
+		};
+		if (subscribe && subscribeEvents.includes(type)) {
+			check = true;
+		};
+		return check;
+	};
+
+};
+
+export const dispatcher = new Dispatcher();
